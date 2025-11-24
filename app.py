@@ -5,74 +5,117 @@ import re
 import io
 import altair as alt
 
-# --- 1. 頁面設定 (必須在程式最開頭) ---
+# --- 1. 頁面設定 ---
 st.set_page_config(
-    page_title="Mont-bell 型錄數位化儀表板",
+    page_title="Mont-bell 型錄數位化儀表板 Ver 5.0",
     page_icon="🏔️",
-    layout="wide",  # 使用寬版面，讓表格和圖表更清楚
+    layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# --- 2. 核心解析邏輯 (維持 Ver 3.0 的精準度) ---
+# --- 2. 核心解析邏輯 (Ver 5.0: 強力過濾 Material 中的顏色雜訊) ---
 def parse_product_page(text, page_num):
     data = {}
     data['Page'] = page_num
     
     # 預處理
     clean_text = text.replace('\r\n', '\n')
-
-    # 基礎資訊
-    style_match = re.search(r"Style#\s*(\d+)", clean_text, re.IGNORECASE)
-    if not style_match: return None
-    data['Style#'] = style_match.group(1)
-
-    price_match = re.search(r"MSRP\s*[¥￥]?\s*([\d,]+)", clean_text, re.IGNORECASE)
-    alt_price = re.search(r"[¥￥]\s*([\d,]+)", clean_text)
-    if price_match: data['MSRP'] = price_match.group(1).replace(',', '')
-    elif alt_price: data['MSRP'] = alt_price.group(1).replace(',', '')
-    else: data['MSRP'] = "0" # 預設為 0 以便統計
-
-    weight_match = re.search(r"Estimated Average Weight\s*[\n]*\s*(\d+\.?\d*|TBA|ТВА)", clean_text, re.IGNORECASE)
-    if weight_match: data['Weight (g)'] = weight_match.group(1).replace('ТВА', 'TBA')
-    else: data['Weight (g)'] = ""
-
-    # 產品名稱
     lines = [l.strip() for l in clean_text.split('\n') if l.strip()]
-    product_name = ""
-    style_idx = -1
+
+    # --- A. Style# 與 產品名稱 ---
+    primary_style_index = -1
+    primary_style_num = ""
+
     for i, line in enumerate(lines):
-        if "Style#" in line:
-            style_idx = i
+        # 尋找 Style#
+        match = re.search(r"Style#\s*(\d+)", line, re.IGNORECASE)
+        if match:
+            if "(" in line and "style" in line.lower(): continue # 排除 Western Size
+            primary_style_index = i
+            primary_style_num = match.group(1)
             break
-    if style_idx > 0:
-        for k in range(style_idx - 1, -1, -1):
+    
+    if primary_style_index == -1: return None
+    data['Style#'] = primary_style_num
+
+    # 產品名稱 (往上找)
+    product_name = ""
+    if primary_style_index > 0:
+        for k in range(primary_style_index - 1, -1, -1):
             curr = lines[k]
-            skip_keywords = ["mont-bell", "Fall", "Winter", "NEW", "REVISED", "MSRP", "¥", "CONFIDENTIAL", "Western", "Available"]
+            skip_keywords = ["mont-bell", "Fall", "Winter", "NEW", "REVISED", "MSRP", "¥", "CONFIDENTIAL", "Western", "Available", "Fabric Sample"]
             is_noise = False
             for kw in skip_keywords:
                 if kw.lower() in curr.lower(): is_noise = True; break
             if re.search(r"^[A-Z]{2,3}\(.*\)$", curr): is_noise = True
+            if "¥" in curr or "MSRP" in curr: is_noise = True
+
             if not is_noise:
                 product_name = curr
                 break
     data['Product Name'] = product_name
 
-    # Features & Material
-    features_match = re.search(r"Features\s*\n(.*?)(?=\n\s*Material)", clean_text, re.DOTALL | re.IGNORECASE)
-    data['Features'] = features_match.group(1).strip() if features_match else ""
+    # --- B. 價格與重量 ---
+    price_match = re.search(r"MSRP\s*[¥￥]?\s*([\d,]+)", clean_text, re.IGNORECASE)
+    alt_price = re.search(r"[¥￥]\s*([\d,]+)", clean_text)
+    if price_match: data['MSRP'] = price_match.group(1).replace(',', '')
+    elif alt_price: data['MSRP'] = alt_price.group(1).replace(',', '')
+    else: data['MSRP'] = "0"
 
-    material_match = re.search(r"Material\s*\n(.*?)(?=\n\s*(Size|Estimated Average Weight))", clean_text, re.DOTALL | re.IGNORECASE)
-    data['Material'] = material_match.group(1).strip() if material_match else ""
+    weight_match = re.search(r"Estimated Average Weight\s*[\n]*\s*(\d+\.?\d*|TBA|ТВА)", clean_text, re.IGNORECASE)
+    if weight_match: data['Weight (g)'] = weight_match.group(1).replace('ТВА', 'TBA')
+    else: data['Weight (g)'] = ""
 
-    # Description
-    desc_content = []
+    # --- C. Features (區塊抓取) ---
+    features_list = []
+    is_collecting_features = False
+    stop_keywords = ["Material", "Size", "Estimated", "Last Updated", "CONFIDENTIAL"]
+
     for line in lines:
-        if "Features" in line: break
-        if line.startswith("•") or line.startswith("●"):
-            desc_content.append(line.replace("•", "").replace("●", "").strip())
-    data['Description'] = "\n".join(desc_content)
+        if line.strip() == "Features":
+            is_collecting_features = True
+            continue
+        if is_collecting_features:
+            # 檢查停止詞
+            if any(line.startswith(kw) for kw in stop_keywords): break
+            # 檢查是否為顏色代碼 (例如 BK(Black)) -> 視為雜訊剔除
+            if re.search(r"^[A-Z]{2,4}\([A-Za-z0-9\s]+\)", line): continue
+            features_list.append(line)
+    data['Features'] = "\n".join(features_list)
 
-    # Category
+    # --- D. Material (區塊抓取 + 顏色過濾) ---
+    material_list = []
+    is_collecting_material = False
+    
+    for line in lines:
+        if line.strip() == "Material":
+            is_collecting_material = True
+            continue
+        
+        if is_collecting_material:
+            # 1. 檢查結束條件
+            if any(line.startswith(kw) for kw in ["Size", "Estimated", "Last Updated", "CONFIDENTIAL"]):
+                break
+            
+            # 2. 檢查是否為尺寸列表 (例如 "S, M, L, XL") -> 這是材質結束的強烈訊號
+            if re.search(r"^[XSML\s,]+$", line) or "Size" in line: 
+                break
+
+            # 3. 關鍵過濾：剔除顏色代碼
+            # Regex 邏輯：開頭是 2-4 個大寫字母，緊接著括號 (例如 BK(Black), LGY(Light Gray))
+            # 這樣可以保留 "CLIMAPLUS (100% polyester)" 這種材質描述 (因為 CLIMAPLUS 長度 > 4)
+            if re.search(r"^[A-Z0-9]{2,4}\([A-Za-z0-9\s]+\)", line): 
+                continue
+            
+            # 4. 過濾多個顏色在同一行的情況 (例如 "BL(Blue) RD(Red)")
+            if re.search(r"^[A-Z]{2,3}\(.*\)\s+[A-Z]{2,3}\(.*\)", line):
+                continue
+
+            material_list.append(line)
+
+    data['Material'] = "\n".join(material_list)
+
+    # --- E. Category ---
     categories = ["ALPINE CLOTHING", "INSULATION", "THERMAL", "RAIN WEAR", "SOFT SHELL", "PANTS", "BASE LAYER", "FIELD WEAR", "TRAVEL & COUNTRY", "CAP & HAT", "GLOVES", "SOCKS", "SLEEPING BAG", "FOOTWEAR", "BACKPACK", "BAG", "ACCESSORIES", "CYCLING", "SNOW GEAR", "CLIMBING", "FISHING", "PADDLE SPORTS", "DOG GEAR", "KIDS & BABY"]
     data['Category'] = "Uncategorized"
     for cat in categories:
@@ -80,34 +123,16 @@ def parse_product_page(text, page_num):
 
     return data
 
-# --- 3. 側邊欄介面 (Sidebar) ---
+# --- 3. 側邊欄介面 ---
 with st.sidebar:
-    st.image("https://upload.wikimedia.org/wikipedia/commons/thumb/8/87/PDF_file_icon.svg/1667px-PDF_file_icon.svg.png", width=50)
     st.header("步驟 1: 上傳檔案")
     uploaded_file = st.file_uploader("請選擇 Mont-bell PDF 型錄", type="pdf")
-    
-    st.markdown("---")
-    st.info("💡 **提示：** \n此工具會自動識別產品頁面，並忽略目錄或封面頁。")
+    st.info("Ver 5.0 更新：強力過濾 Material 欄位中的顏色雜訊。")
 
-# --- 4. 主畫面介面 (Main) ---
-st.title("🏔️ Mont-bell 產品型錄數位化儀表板")
+# --- 4. 主畫面介面 ---
+st.title("🏔️ Mont-bell 產品型錄數位化儀表板 (Ver 5.0)")
 
-if uploaded_file is None:
-    # 尚未上傳檔案時的歡迎畫面
-    st.markdown("""
-    ### 👋 歡迎使用
-    這個工具能將 PDF 型錄轉換為 **視覺化數據** 與 **Excel 報表**。
-    
-    **功能特色：**
-    * ✅ **智慧擷取**：自動抓取 Style#, 價格, 重量, 材質, 特色。
-    * ✅ **數據清洗**：自動移除頁眉、頁碼等雜訊。
-    * ✅ **視覺分析**：自動生成分類統計圖表。
-    
-    👈 請從左側上傳檔案以開始。
-    """)
-
-else:
-    # 檔案已上傳，顯示操作按鈕
+if uploaded_file is not None:
     col1, col2 = st.columns([1, 5])
     with col1:
         start_btn = st.button("🚀 開始分析 PDF", type="primary", use_container_width=True)
@@ -120,101 +145,71 @@ else:
         try:
             with pdfplumber.open(uploaded_file) as pdf:
                 total_pages = len(pdf.pages)
-                
                 for i, page in enumerate(pdf.pages):
-                    # 更新進度條
                     percent = int((i + 1) / total_pages * 100)
                     my_bar.progress(percent, text=f"正在分析第 {i+1}/{total_pages} 頁... (已擷取 {len(products)} 項產品)")
-                    
                     text = page.extract_text()
                     if not text: continue
-                    
                     p_data = parse_product_page(text, i + 1)
-                    if p_data:
-                        products.append(p_data)
+                    if p_data: products.append(p_data)
             
-            my_bar.empty() # 清除進度條
+            my_bar.empty()
 
             if products:
-                # 資料處理
                 df = pd.DataFrame(products)
-                
-                # 數值轉換 (方便做圖表)
-                df['MSRP (JPY)'] = pd.to_numeric(df['MSRP'], errors='coerce').fillna(0)
-                
-                # --- 5. 視覺化儀表板呈現 ---
+                df['MSRP'] = pd.to_numeric(df['MSRP'], errors='coerce').fillna(0)
                 
                 st.success(f"✅ 分析完成！共擷取 **{len(products)}** 項產品資料。")
                 
-                # 頂部關鍵指標 (KPIs)
+                # KPI
                 kpi1, kpi2, kpi3, kpi4 = st.columns(4)
                 kpi1.metric("總產品數", f"{len(df)} 件")
                 kpi2.metric("產品類別數", f"{df['Category'].nunique()} 類")
-                avg_price = df[df['MSRP (JPY)'] > 0]['MSRP (JPY)'].mean()
-                kpi3.metric("平均單價 (MSRP)", f"¥{avg_price:,.0f}")
-                kpi4.metric("資料來源頁數", f"{total_pages} 頁")
-                
+                avg_price = df[df['MSRP'] > 0]['MSRP'].mean()
+                kpi3.metric("平均單價", f"¥{avg_price:,.0f}")
+                kpi4.metric("資料來源", f"{total_pages} 頁")
                 st.markdown("---")
 
-                # 分頁內容
                 tab1, tab2 = st.tabs(["📊 視覺化分析", "📋 詳細資料表 & 下載"])
                 
                 with tab1:
-                    # 圖表：各類別產品數量
                     st.subheader("📦 產品類別分佈")
                     chart_data = df['Category'].value_counts().reset_index()
                     chart_data.columns = ['Category', 'Count']
-                    
                     bar_chart = alt.Chart(chart_data).mark_bar().encode(
                         x=alt.X('Category', sort='-y', title='產品類別'),
                         y=alt.Y('Count', title='產品數量'),
                         color=alt.Color('Category', legend=None, scale=alt.Scale(scheme='tableau20')),
                         tooltip=['Category', 'Count']
                     ).properties(height=400)
-                    
                     st.altair_chart(bar_chart, use_container_width=True)
-                    
-                    # 圖表：價格分佈 (Histogram)
-                    st.subheader("💰 價格分佈區間 (JPY)")
-                    price_chart = alt.Chart(df[df['MSRP (JPY)'] > 0]).mark_bar().encode(
-                        x=alt.X('MSRP (JPY)', bin=alt.Bin(maxbins=20), title='價格區間 (JPY)'),
-                        y=alt.Y('count()', title='產品數量'),
-                        color=alt.value('#ff7f0e')
-                    ).properties(height=300)
-                    st.altair_chart(price_chart, use_container_width=True)
 
                 with tab2:
-                    # 資料預覽與下載
                     st.subheader("詳細資料清單")
-                    
-                    # 欄位篩選顯示
-                    display_cols = ['Page', 'Category', 'Product Name', 'Style#', 'MSRP', 'Weight (g)', 'Features']
+                    display_cols = ['Page', 'Category', 'Product Name', 'Style#', 'MSRP', 'Weight (g)', 'Material', 'Features']
                     st.dataframe(
                         df[display_cols], 
                         use_container_width=True,
                         column_config={
-                            "Page": st.column_config.NumberColumn("頁碼", width="small"),
-                            "MSRP": st.column_config.TextColumn("價格 (JPY)", width="small"),
-                            "Features": st.column_config.TextColumn("產品特點", width="large"),
+                            "Features": st.column_config.TextColumn("產品特點", width="medium"),
+                            "Material": st.column_config.TextColumn("材質 (已過濾顏色)", width="medium"),
                         }
                     )
                     
-                    # Excel 下載按鈕
                     output = io.BytesIO()
                     with pd.ExcelWriter(output, engine='openpyxl') as writer:
                         df.to_excel(writer, index=False, sheet_name='Products')
                     excel_data = output.getvalue()
                     
                     st.download_button(
-                        label="📥 下載完整 Excel 報表",
+                        label="📥 下載 Excel 報表",
                         data=excel_data,
-                        file_name="Montbell_Product_List.xlsx",
+                        file_name="Montbell_Product_List_v5.xlsx",
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                         type="primary"
                     )
-
             else:
-                st.warning("⚠️ PDF 讀取完畢，但未發現符合「產品頁面格式」的資料。請確認上傳檔案是否正確。")
+                st.warning("⚠️ 未發現符合格式的資料。")
 
         except Exception as e:
             st.error(f"❌ 發生錯誤: {e}")
