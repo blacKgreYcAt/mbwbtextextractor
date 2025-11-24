@@ -7,93 +7,129 @@ import altair as alt
 
 # --- 1. 頁面設定 ---
 st.set_page_config(
-    page_title="Mont-bell 型錄數位化儀表板 Ver 7.0",
+    page_title="Mont-bell 萬用型錄解析器 Ver 8.0",
     page_icon="🏔️",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# --- 2. 核心解析邏輯 (Ver 7.0: 全文搜尋 + 行定位技術) ---
+# --- 2. 核心解析邏輯 (Ver 8.0: 三層搜尋 + 暴力 7 碼數字匹配) ---
 def parse_product_page(text, page_num):
     data = {}
     data['Page'] = page_num
     
-    # 預處理：統一換行，方便處理
-    clean_text = text.replace('\r\n', '\n')
+    # 預處理：統一換行，移除 BOM 或是奇怪的隱形字元
+    clean_text = text.replace('\r\n', '\n').strip()
+    if not clean_text: return None
+
     lines = [l.strip() for l in clean_text.split('\n') if l.strip()]
 
-    # --- A. Style# 智慧搜尋 (修復：支援跨行搜尋) ---
+    # --- A. Style Number 終極搜尋策略 ---
     primary_style_index = -1
     primary_style_num = ""
 
-    # 1. 先在「全文」中搜尋所有 Style# 候選者 (解決斷行問題)
-    # 允許 "Style" 與 "#" 與 "數字" 之間有空白或換行
-    style_candidates = list(re.finditer(r"Style\s*#?\s*(\d+)", clean_text, re.IGNORECASE))
-    
-    if not style_candidates:
-        return None # 這頁完全沒有 Style#
+    # 定義不同的 Regex 模式 (優先級由高到低)
+    patterns = [
+        r"Style\s*#?\s*(\d{7})",  # 標準: Style# 1101002 (限制7碼更精準)
+        r"Style\s*No\.?\s*(\d{7})", # 變體: Style No. 1101002
+        r"Item\s*#?\s*(\d{7})",     # 變體: Item# 1101002
+        r"(?<!\d)(\d{7})(?!\d)"     # 暴力: 任何獨立的 7 碼數字 (Mont-bell 邏輯)
+    ]
 
-    # 2. 過濾 Western Size
-    for match in style_candidates:
-        # 取得這個 Style# 在全文中的位置
-        start_pos = match.start()
-        
-        # 反查這個 Style# 位於第幾行 (計算前面的換行符號數量)
-        # 這樣我們就能回到 lines 陣列中進行精準操作
-        line_idx = clean_text.count('\n', 0, start_pos)
-        
-        # 檢查該行是否有 Western Size 特徵
-        # 注意：因為可能是跨行，我們檢查 Style# 所在的那一行
-        current_line_content = lines[line_idx] if line_idx < len(lines) else ""
-        
-        # 如果這一行包含 "(style" 或 "( style"，視為 Western Size 跳過
-        if re.search(r"\(\s*style", current_line_content, re.IGNORECASE):
-            continue
-            
-        # 找到目標！
-        primary_style_index = line_idx
-        primary_style_num = match.group(1)
-        break
+    # 用來排除誤判的 7 碼數字 (例如電話、日期、KJ註記編號)
+    # 這裡假設型號通常以 11, 23, 12 開頭 (根據你的型錄觀察)
+    # 若你的型號範圍更廣，可以移除這個檢查
+    valid_prefixes = ["11", "21", "23", "33", "04", "05", "12"] 
+
+    found_match = False
     
-    # 如果所有候選者都被過濾掉 (非常罕見)，則不回傳資料
-    if primary_style_index == -1:
-        return None
+    # 開始逐行掃描 (為了抓到正確的行號 primary_style_index)
+    for i, line in enumerate(lines):
+        # 忽略 Western Size 行
+        if re.search(r"\(\s*style", line, re.IGNORECASE): continue
+        if "KJ" in line: continue # 忽略註記行
+
+        for pat in patterns:
+            matches = list(re.finditer(pat, line, re.IGNORECASE))
+            for m in matches:
+                candidate = m.group(1)
+                
+                # 驗證候選人: 必須是 7 碼
+                if len(candidate) != 7: continue
+                
+                # 驗證開頭 (可選: 增加準確度)
+                # if not any(candidate.startswith(p) for p in valid_prefixes): continue
+                
+                # 排除像價格的數字 (雖然價格通常有逗號，但以防萬一)
+                if "¥" in line or "MSRP" in line:
+                    # 除非這行明確寫了 Style
+                    if "Style" not in line and "Item" not in line:
+                        continue
+
+                primary_style_index = i
+                primary_style_num = candidate
+                found_match = True
+                break
+            if found_match: break
+        if found_match: break
+
+    # 如果逐行找不到，嘗試「全文跨行搜尋」 (針對 Style# 和數字斷行的情況)
+    if not found_match:
+        # 只用最寬鬆的 pattern 找
+        candidates = list(re.finditer(r"Style\s*#?\s*(\d{7})", clean_text, re.IGNORECASE))
+        if candidates:
+            # 取第一個找到的
+            match = candidates[0]
+            primary_style_num = match.group(1)
+            # 反查行號
+            primary_style_index = clean_text.count('\n', 0, match.start())
+            found_match = True
+
+    if not found_match:
+        return None # 真的找不到產品
 
     data['Style#'] = primary_style_num
 
-    # --- B. 產品名稱 (基於 Style# 的行數往上找) ---
+    # --- B. 產品名稱 (基於 Style# 往上找) ---
     product_name = ""
     
-    # 策略 1: 檢查 Style# 同一行前方是否有字
-    if primary_style_index < len(lines):
-        style_line = lines[primary_style_index]
-        # 嘗試移除 Style# 後的部分
-        pre_style_text = re.split(r"Style", style_line, flags=re.IGNORECASE)[0].strip()
-        if len(pre_style_text) > 3 and "NEW" not in pre_style_text:
-            product_name = pre_style_text
-
-    # 策略 2: 往上找 (主要策略)
-    if not product_name and primary_style_index > 0:
-        for k in range(primary_style_index - 1, -1, -1):
+    # 策略: 往上找 5 行以內，通常名稱都在附近
+    if primary_style_index > 0:
+        search_range = range(primary_style_index - 1, max(-1, primary_style_index - 6), -1)
+        for k in search_range:
             curr = lines[k]
+            
             # 排除雜訊
             skip_keywords = [
-                "mont-bell", "Fall", "Winter", "NEW", "REVISED", 
-                "MSRP", "¥", "CONFIDENTIAL", "Western", "Available",
-                "Fabric Sample", "Men's", "Women's", "Kid's", "Baby's"
+                "mont-bell", "Fall", "Winter", "Spring", "Summer", 
+                "NEW", "REVISED", "MSRP", "¥", "CONFIDENTIAL", 
+                "Western", "Available", "Fabric Sample", "KJ", "註記"
             ]
             is_noise = False
             for kw in skip_keywords:
                 if kw.lower() in curr.lower(): is_noise = True; break
-            if re.search(r"^[A-Z]{2,3}\(.*\)$", curr): is_noise = True # 顏色代碼
             
+            if re.search(r"^[A-Z]{2,3}\(.*\)$", curr): is_noise = True
+            
+            # 排除純數字行 (可能是頁碼)
+            if curr.isdigit(): is_noise = True
+
             if not is_noise:
                 product_name = curr
                 break
     
+    # 如果往上找不到，試試看 Style# 同一行
+    if not product_name and primary_style_index < len(lines):
+        line = lines[primary_style_index]
+        # 移除 Style# 及其後面的數字
+        clean_line = re.sub(r"Style.*?(\d{7})", "", line, flags=re.IGNORECASE).strip()
+        clean_line = re.sub(r"\d{7}", "", clean_line).strip() # 移除純數字
+        if len(clean_line) > 3 and "MSRP" not in clean_line:
+            product_name = clean_line
+
     data['Product Name'] = product_name
 
-    # --- C. 價格與重量 (全文搜尋) ---
+    # --- C. 價格與重量 ---
     price_match = re.search(r"MSRP\s*[¥￥]?\s*([\d,]+)", clean_text, re.IGNORECASE)
     alt_price = re.search(r"[¥￥]\s*([\d,]+)", clean_text)
     if price_match: data['MSRP'] = price_match.group(1).replace(',', '')
@@ -104,42 +140,46 @@ def parse_product_page(text, page_num):
     if weight_match: data['Weight (g)'] = weight_match.group(1).replace('ТВА', 'TBA')
     else: data['Weight (g)'] = ""
 
-    # --- D. Features (區塊抓取) ---
-    features_list = []
-    is_collecting_features = False
-    stop_keywords = ["Material", "Size", "Estimated", "Last Updated", "CONFIDENTIAL"]
-
-    for line in lines:
-        if line.strip() == "Features":
-            is_collecting_features = True
-            continue
-        if is_collecting_features:
-            if any(line.startswith(kw) for kw in stop_keywords): break
-            # 過濾顏色代碼
-            if re.search(r"^[A-Z0-9]{2,4}\([A-Za-z0-9\s]+\)", line): continue
-            features_list.append(line)
-    data['Features'] = "\n".join(features_list)
-
-    # --- E. Material (區塊抓取 + 強力過濾) ---
-    material_list = []
-    is_collecting_material = False
+    # --- D. Features & Material (通用關鍵字搜尋) ---
+    # 建立一個關鍵字映射表，應對不同年份的寫法
+    headers = {
+        "Features": ["Features", "Feature", "Functions", "Characteristics"],
+        "Material": ["Material", "Materials", "Fabric", "Fabrics"]
+    }
     
-    for line in lines:
-        if line.strip() == "Material":
-            is_collecting_material = True
-            continue
-        if is_collecting_material:
-            if any(line.startswith(kw) for kw in ["Size", "Estimated", "Last Updated", "CONFIDENTIAL"]): break
-            if re.search(r"^[XSML\s,]+$", line) or "Size" in line: break
+    stop_keywords = ["Size", "Estimated", "Last Updated", "CONFIDENTIAL", "MSRP"]
+    
+    # 輔助函式：抓取區塊
+    def extract_block(target_headers):
+        content = []
+        is_collecting = False
+        
+        for line in lines:
+            # 檢查是否為標題行
+            if any(line.strip().startswith(h) for h in target_headers):
+                is_collecting = True
+                continue
+            
+            if is_collecting:
+                # 檢查停止條件 (遇到其他大標題)
+                # 檢查 Features 標題
+                if any(line.strip().startswith(h) for h in headers["Features"]) and "Features" not in target_headers: break
+                # 檢查 Material 標題
+                if any(line.strip().startswith(h) for h in headers["Material"]) and "Material" not in target_headers: break
+                # 檢查通用停止詞
+                if any(line.startswith(kw) for kw in stop_keywords): break
+                
+                # 顏色與尺寸過濾
+                if re.search(r"^[A-Z0-9]{2,4}\([A-Za-z0-9\s]+\)", line): continue # 顏色代碼
+                if re.search(r"^[XSML\s,]+$", line) or "Size" in line: break      # 尺寸行
 
-            # 顏色過濾
-            if re.search(r"^[A-Z0-9]{2,4}\(", line): continue
-            if re.search(r"\)\s+[A-Z]{2,3}\(", line): continue
+                content.append(line)
+        return "\n".join(content)
 
-            material_list.append(line)
-    data['Material'] = "\n".join(material_list)
+    data['Features'] = extract_block(headers["Features"])
+    data['Material'] = extract_block(headers["Material"])
 
-    # --- F. Category ---
+    # --- E. Category ---
     categories = ["ALPINE CLOTHING", "INSULATION", "THERMAL", "RAIN WEAR", "SOFT SHELL", "PANTS", "BASE LAYER", "FIELD WEAR", "TRAVEL & COUNTRY", "CAP & HAT", "GLOVES", "SOCKS", "SLEEPING BAG", "FOOTWEAR", "BACKPACK", "BAG", "ACCESSORIES", "CYCLING", "SNOW GEAR", "CLIMBING", "FISHING", "PADDLE SPORTS", "DOG GEAR", "KIDS & BABY"]
     data['Category'] = "Uncategorized"
     for cat in categories:
@@ -147,92 +187,118 @@ def parse_product_page(text, page_num):
 
     return data
 
-# --- 3. 側邊欄介面 ---
+# --- 3. 側邊欄 ---
 with st.sidebar:
     st.header("步驟 1: 上傳檔案")
-    uploaded_file = st.file_uploader("請選擇 Mont-bell PDF 型錄", type="pdf")
-    st.info("Ver 7.0 修正重點：\n1. 修正「抓不到資料」問題 (解決 Style# 斷行)\n2. 修正「產品名稱」抓取邏輯\n3. 保持材質顏色過濾")
+    uploaded_files = st.file_uploader("可多選上傳 PDF", type="pdf", accept_multiple_files=True)
+    st.info("Ver 8.0 強力版：\n1. 支援多檔批次處理\n2. 暴力搜尋 7 碼型號 (解決格式跑版)\n3. 相容 KJ 註記與不同年份格式")
 
-# --- 4. 主畫面介面 ---
-st.title("🏔️ Mont-bell 產品型錄數位化儀表板 (Ver 7.0 穩定版)")
+# --- 4. 主畫面 ---
+st.title("🏔️ Mont-bell 萬用型錄解析器 (Ver 8.0)")
 
-if uploaded_file is not None:
+if uploaded_files:
     col1, col2 = st.columns([1, 5])
     with col1:
-        start_btn = st.button("🚀 開始分析 PDF", type="primary", use_container_width=True)
+        start_btn = st.button("🚀 開始分析", type="primary", use_container_width=True)
     
     if start_btn:
-        products = []
-        progress_text = "正在啟動 PDF 引擎..."
-        my_bar = st.progress(0, text=progress_text)
+        all_products = []
         
-        try:
-            with pdfplumber.open(uploaded_file) as pdf:
-                total_pages = len(pdf.pages)
-                for i, page in enumerate(pdf.pages):
-                    percent = int((i + 1) / total_pages * 100)
-                    my_bar.progress(percent, text=f"正在分析第 {i+1}/{total_pages} 頁... (已擷取 {len(products)} 項產品)")
-                    text = page.extract_text()
-                    if not text: continue
-                    p_data = parse_product_page(text, i + 1)
-                    if p_data: products.append(p_data)
+        # 建立進度條容器
+        progress_text = st.empty()
+        my_bar = st.progress(0)
+        
+        total_pdfs = len(uploaded_files)
+        
+        for file_idx, uploaded_file in enumerate(uploaded_files):
+            try:
+                with pdfplumber.open(uploaded_file) as pdf:
+                    total_pages = len(pdf.pages)
+                    filename = uploaded_file.name
+                    
+                    for i, page in enumerate(pdf.pages):
+                        # 更新全域進度
+                        current_progress = (file_idx + (i / total_pages)) / total_pdfs
+                        my_bar.progress(current_progress)
+                        progress_text.text(f"正在處理: {filename} (第 {i+1}/{total_pages} 頁)...")
+                        
+                        text = page.extract_text()
+                        if not text: continue
+                        
+                        p_data = parse_product_page(text, i + 1)
+                        if p_data:
+                            p_data['Source File'] = filename # 標記來源檔案
+                            all_products.append(p_data)
+                            
+            except Exception as e:
+                st.error(f"檔案 {uploaded_file.name} 讀取失敗: {e}")
+
+        my_bar.empty()
+        progress_text.empty()
+
+        if all_products:
+            df = pd.DataFrame(all_products)
+            df['MSRP'] = pd.to_numeric(df['MSRP'], errors='coerce').fillna(0)
             
-            my_bar.empty()
-
-            if products:
-                df = pd.DataFrame(products)
-                df['MSRP'] = pd.to_numeric(df['MSRP'], errors='coerce').fillna(0)
+            st.success(f"✅ 全部分析完成！共擷取 **{len(df)}** 項產品。")
+            
+            # 建立 Tabs
+            tab1, tab2, tab3 = st.tabs(["📊 總表與下載", "📈 交叉分析", "🛠️ 除錯模式 (Debug)"])
+            
+            with tab1:
+                st.subheader("📋 整合資料清單")
+                display_cols = ['Source File', 'Page', 'Category', 'Product Name', 'Style#', 'MSRP', 'Features', 'Material']
+                st.dataframe(
+                    df[display_cols], 
+                    use_container_width=True, 
+                    column_config={
+                        "Features": st.column_config.TextColumn("特點", width="medium"),
+                        "Material": st.column_config.TextColumn("材質", width="medium")
+                    }
+                )
                 
-                st.success(f"✅ 分析完成！共擷取 **{len(products)}** 項產品資料。")
+                output = io.BytesIO()
+                with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                    df.to_excel(writer, index=False, sheet_name='All_Products')
+                excel_data = output.getvalue()
                 
-                kpi1, kpi2, kpi3, kpi4 = st.columns(4)
-                kpi1.metric("總產品數", f"{len(df)} 件")
-                kpi2.metric("產品類別數", f"{df['Category'].nunique()} 類")
-                avg_price = df[df['MSRP'] > 0]['MSRP'].mean()
-                kpi3.metric("平均單價", f"¥{avg_price:,.0f}")
-                kpi4.metric("資料來源", f"{total_pages} 頁")
-                st.markdown("---")
+                st.download_button(
+                    label="📥 下載完整 Excel (含所有檔案)",
+                    data=excel_data,
+                    file_name="Montbell_Merged_Catalog.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    type="primary"
+                )
 
-                tab1, tab2 = st.tabs(["📊 視覺化分析", "📋 詳細資料表 & 下載"])
+            with tab2:
+                st.subheader("年份/檔案交叉比對")
+                chart = alt.Chart(df).mark_bar().encode(
+                    x=alt.X('Source File', title='來源檔案'),
+                    y=alt.Y('count()', title='產品數量'),
+                    color='Category',
+                    tooltip=['Source File', 'Category', 'count()']
+                ).properties(height=400)
+                st.altair_chart(chart, use_container_width=True)
+
+            with tab3:
+                st.subheader("🛠️ 原始資料檢視 (用於除錯)")
+                st.markdown("如果你發現某頁資料抓錯，請在此查看該頁的「原始擷取文字」。")
                 
-                with tab1:
-                    st.subheader("📦 產品類別分佈")
-                    chart_data = df['Category'].value_counts().reset_index()
-                    chart_data.columns = ['Category', 'Count']
-                    bar_chart = alt.Chart(chart_data).mark_bar().encode(
-                        x=alt.X('Category', sort='-y', title='產品類別'),
-                        y=alt.Y('Count', title='產品數量'),
-                        color=alt.Color('Category', legend=None, scale=alt.Scale(scheme='tableau20')),
-                        tooltip=['Category', 'Count']
-                    ).properties(height=400)
-                    st.altair_chart(bar_chart, use_container_width=True)
+                # 讓使用者選擇要檢查的檔案與頁數
+                debug_file = st.selectbox("選擇檔案", [f.name for f in uploaded_files])
+                debug_page = st.number_input("輸入頁碼 (1-based)", min_value=1, value=5)
+                
+                if st.button("檢視原始文字"):
+                    # 重新讀取該頁 (為了顯示) - 這裡稍微沒效率但在 debug 模式可接受
+                    target_file_obj = next(f for f in uploaded_files if f.name == debug_file)
+                    # 需重置 pointer
+                    target_file_obj.seek(0) 
+                    with pdfplumber.open(target_file_obj) as dbg_pdf:
+                        if debug_page <= len(dbg_pdf.pages):
+                            raw_txt = dbg_pdf.pages[debug_page-1].extract_text()
+                            st.text_area("PDF Raw Text Content:", raw_txt, height=400)
+                        else:
+                            st.error("頁碼超出範圍")
 
-                with tab2:
-                    st.subheader("詳細資料清單")
-                    display_cols = ['Page', 'Category', 'Product Name', 'Style#', 'MSRP', 'Weight (g)', 'Material', 'Features']
-                    st.dataframe(
-                        df[display_cols], 
-                        use_container_width=True,
-                        column_config={
-                            "Features": st.column_config.TextColumn("產品特點", width="large"),
-                            "Material": st.column_config.TextColumn("材質", width="medium"),
-                        }
-                    )
-                    
-                    output = io.BytesIO()
-                    with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                        df.to_excel(writer, index=False, sheet_name='Products')
-                    excel_data = output.getvalue()
-                    
-                    st.download_button(
-                        label="📥 下載 Excel 報表",
-                        data=excel_data,
-                        file_name="Montbell_Product_List_v7.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        type="primary"
-                    )
-            else:
-                st.warning("⚠️ 未發現符合格式的資料。請確認 PDF 是否包含可選取的文字。")
-
-        except Exception as e:
-            st.error(f"❌ 發生錯誤: {e}")
+        else:
+            st.warning("⚠️ 掃描了所有檔案，但未發現符合格式的資料。請切換到「除錯模式」檢查原始文字是否為亂碼或圖片。")
